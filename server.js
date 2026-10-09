@@ -179,17 +179,54 @@ async function streamUpstream(req, res, target) {
     return res.end(playlist);
   }
 
+  // Live MPEG-TS: providers drop the connection every few seconds. Keep ONE open response to the
+  // player and silently re-open the provider behind it, so the viewer never sees a cut or a loop.
+  const isLiveTs = !req.headers.range && /\/live\//i.test(target) && !/\.m3u8/i.test(target);
   const headers = { ...cors };
   for (const name of ["content-type", "content-length", "content-range", "accept-ranges"]) {
     const value = upstream.headers.get(name);
     if (value) headers[name] = value;
   }
-  if (!headers["accept-ranges"]) headers["accept-ranges"] = "bytes";
-  res.writeHead(upstream.status, headers);
-  for await (const chunk of upstream.body) {
-    if (!res.write(chunk)) await new Promise((resolve) => res.once("drain", resolve));
+  if (isLiveTs) {
+    delete headers["content-length"]; delete headers["content-range"]; delete headers["accept-ranges"];
+    headers["content-type"] = headers["content-type"] || "video/mp2t";
+    headers["cache-control"] = "no-store";
+  } else if (!headers["accept-ranges"]) headers["accept-ranges"] = "bytes";
+  res.writeHead(upstream.status === 206 && isLiveTs ? 200 : upstream.status, headers);
+
+  let closed = false;
+  const controller = new AbortController();
+  res.on("close", () => { closed = true; controller.abort(); });
+  const pipe = async (body) => {
+    try {
+      for await (const chunk of body) {
+        if (closed) return;
+        if (!res.write(chunk)) await new Promise((resolve) => res.once("drain", resolve));
+      }
+    } catch { /* provider dropped mid-chunk; reconnect below */ }
+  };
+  await pipe(upstream.body);
+  if (isLiveTs) {
+    let misses = 0;
+    while (!closed && misses < 20) {
+      try {
+        let url = target, next;
+        for (let hop = 0; hop < 5; hop++) {
+          next = await fetch(url, { headers: { "User-Agent": UA, Accept: "*/*" }, redirect: "manual", signal: controller.signal });
+          const loc = next.headers.get("location");
+          if (next.status >= 300 && next.status < 400 && loc) { url = resolveUrl(url, loc); continue; }
+          break;
+        }
+        if (!next || !next.ok) { misses++; await new Promise((r) => setTimeout(r, Math.min(500 * misses, 3000))); continue; }
+        misses = 0;
+        await pipe(next.body);
+      } catch {
+        if (closed) break;
+        misses++; await new Promise((r) => setTimeout(r, Math.min(500 * misses, 3000)));
+      }
+    }
   }
-  res.end();
+  if (!closed) res.end();
 }
 
 async function handleStream(req, res, requestUrl) {
