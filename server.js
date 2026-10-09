@@ -104,9 +104,12 @@ async function handleXtreamPost(req, res, body) {
     const auth = await xtreamGet(server, username, password);
     const userInfo = auth.user_info;
     if (userInfo?.auth !== 1) return sendJson(res, { error: "Invalid credentials or inactive subscription." }, 401);
+    const subStatus = String(userInfo?.status ?? "Active");
+    if (subStatus.toLowerCase() !== "active") return sendJson(res, { error: `Your subscription is ${subStatus.toLowerCase()}. Please renew it with your provider.` }, 403);
     const actions = ["get_live_categories", "get_live_streams", "get_vod_categories", "get_vod_streams", "get_series_categories", "get_series"];
+    const asList = (v) => Array.isArray(v) ? v : v && typeof v === "object" ? Object.values(v).filter((x) => x && typeof x === "object") : [];
     const [liveCats = [], liveStreams = [], vodCats = [], vodStreams = [], seriesCats = [], seriesStreams = []] =
-      await Promise.all(actions.map((action) => xtreamGet(server, username, password, { action })));
+      (await Promise.all(actions.map((action) => xtreamGet(server, username, password, { action }).catch(() => [])))).map(asList);
     const catName = (list, id) => String(list.find((item) => String(item.category_id) === String(id))?.category_name ?? "General");
     const liveUrl = (id) => `${server}/live/${encodeURIComponent(username)}/${encodeURIComponent(password)}/${id}.m3u8`;
     const movieUrl = (id, ext) => `${server}/movie/${encodeURIComponent(username)}/${encodeURIComponent(password)}/${id}.${String(ext || "mp4")}`;
@@ -134,12 +137,15 @@ async function handleXtreamPut(res, body) {
 
 async function streamUpstream(req, res, target) {
   let upstream; let finalUrl = target;
+  let closed = false;
+  const controller = new AbortController();
+  res.on("close", () => { closed = true; controller.abort(); });
   try {
     const headers = { "User-Agent": UA, Accept: "*/*" };
     if (req.headers.range) headers.Range = req.headers.range;
     // Follow redirects manually: IPTV providers often redirect to IP:port hosts that automatic following rejects.
     for (let hop = 0; hop < 5; hop++) {
-      const result = await fetch(finalUrl, { headers, redirect: "manual" });
+      const result = await fetch(finalUrl, { headers, redirect: "manual", signal: controller.signal });
       const location = result.headers.get("location");
       if (result.status >= 300 && result.status < 400 && location) {
         const next = resolveUrl(finalUrl, location);
@@ -194,21 +200,26 @@ async function streamUpstream(req, res, target) {
   } else if (!headers["accept-ranges"]) headers["accept-ranges"] = "bytes";
   res.writeHead(upstream.status === 206 && isLiveTs ? 200 : upstream.status, headers);
 
-  let closed = false;
-  const controller = new AbortController();
-  res.on("close", () => { closed = true; controller.abort(); });
+  // A provider that stops sending without closing would freeze the viewer and hold the
+  // account's only connection slot, so drop it after a few silent seconds and reconnect.
   const pipe = async (body) => {
+    const reader = body.getReader();
+    let idle;
+    const arm = () => { clearTimeout(idle); idle = setTimeout(() => reader.cancel().catch(() => {}), isLiveTs ? 6000 : 60000); };
     try {
-      for await (const chunk of body) {
-        if (closed) return;
-        if (!res.write(chunk)) await new Promise((resolve) => res.once("drain", resolve));
+      arm();
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done || closed) break;
+        arm();
+        if (!res.write(value)) await new Promise((resolve) => { res.once("drain", resolve); res.once("close", resolve); });
       }
-    } catch { /* provider dropped mid-chunk; reconnect below */ }
+    } catch { /* provider dropped mid-chunk; reconnect below */ } finally { clearTimeout(idle); reader.cancel().catch(() => {}); }
   };
   await pipe(upstream.body);
   if (isLiveTs) {
     let misses = 0;
-    while (!closed && misses < 20) {
+    while (!closed) {
       try {
         let url = target, next;
         for (let hop = 0; hop < 5; hop++) {
@@ -332,7 +343,7 @@ function livePage(streamUrl, title) {
   var stuckCount = 0;
   var startedAt = 0;
   var retryTimer = null;
-  var retryDelay = 8000;
+  var retryDelay = 3000;
   var booting = false;
   function scheduleReconnect() {
     if (retryTimer) return;
@@ -340,7 +351,7 @@ function livePage(streamUrl, title) {
       retryTimer = null;
       boot();
     }, retryDelay);
-    retryDelay = Math.min(retryDelay * 2, 30000);
+    retryDelay = Math.min(retryDelay * 2, 10000);
   }
   function boot() {
     if (booting) return;
@@ -368,30 +379,30 @@ function livePage(streamUrl, title) {
       player.load();
       player.play().catch(function () {});
       booting = false;
-      player.on(mpegts.Events.ERROR, function () {
-        scheduleReconnect();
-      });
+      player.on(mpegts.Events.ERROR, function () { retryDelay = 1500; scheduleReconnect(); });
+      player.on(mpegts.Events.LOADING_COMPLETE, function () { retryDelay = 800; scheduleReconnect(); });
     } else {
       video.src = src;
       video.play().catch(function () {});
       booting = false;
     }
+    video.onerror = function () { retryDelay = 1500; scheduleReconnect(); };
   }
   // Resume accidental pauses without rebuilding a healthy buffered stream.
   video.addEventListener("pause", function () {
     if (!video.ended) setTimeout(function () { video.play().catch(function () {}); }, 1000);
   });
   video.addEventListener("playing", function () {
-    retryDelay = 8000;
+    retryDelay = 3000;
     if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
   });
   // Allow a generous startup/buffering window. Reconnect only after a real 30s freeze.
   setInterval(function () {
     if (video.paused) { video.play().catch(function () {}); return; }
-    if (Date.now() - startedAt < 45000) return;
+    if (Date.now() - startedAt < 20000) return;
     if (video.currentTime === lastTime) {
       stuckCount++;
-      if (stuckCount >= 6) { stuckCount = 0; scheduleReconnect(); }
+      if (stuckCount >= 2) { stuckCount = 0; retryDelay = 500; scheduleReconnect(); }
     } else {
       stuckCount = 0;
       lastTime = video.currentTime;
